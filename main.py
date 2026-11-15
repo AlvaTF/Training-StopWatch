@@ -1,50 +1,45 @@
 import asyncio
+import io
+import json
 import os
-import sqlite3
+import tempfile
 import time
 from datetime import date
 
 import flet as ft
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
-# ---------------------------------------------------------------- almacenamiento
-DATA_DIR = os.getenv("FLET_APP_STORAGE_DATA", os.path.abspath("."))
-EXPORT_DIR = os.path.join(DATA_DIR, "exports")
-os.makedirs(EXPORT_DIR, exist_ok=True)
+KEY = "cronoclase_v1"
+XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-db = sqlite3.connect(os.path.join(DATA_DIR, "cronoclase.db"), check_same_thread=False)
-db.executescript(
-    """
-    CREATE TABLE IF NOT EXISTS turnos(
-        id INTEGER PRIMARY KEY);
-    CREATE TABLE IF NOT EXISTS students(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS exercises(
-        id INTEGER PRIMARY KEY AUTOINCREMENT, day TEXT NOT NULL,
-        name TEXT NOT NULL, passes INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS results(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        exercise_id INTEGER NOT NULL, student_id INTEGER NOT NULL,
-        pass_no INTEGER NOT NULL, seconds REAL NOT NULL);
-    """
-)
-# migracion para bases creadas con la version anterior (sin turno)
-try:
-    db.execute("ALTER TABLE students ADD COLUMN turno INTEGER NOT NULL DEFAULT 0")
-except sqlite3.OperationalError:
-    pass
-db.execute("INSERT OR IGNORE INTO turnos(id) SELECT DISTINCT turno FROM students")
-db.commit()
+DATA = {"seq": 0, "turnos": [], "students": [], "exercises": [], "results": []}
 
 
-def q(sql, args=()):
-    return db.execute(sql, args).fetchall()
+# ---------------------------------------------------------------- datos
+def next_id():
+    DATA["seq"] += 1
+    return DATA["seq"]
 
 
-def run(sql, args=()):
-    db.execute(sql, args)
-    db.commit()
+def students(turno=None):
+    return sorted(
+        (s for s in DATA["students"] if turno is None or s["turno"] == turno),
+        key=lambda s: (s["turno"], s["id"]),
+    )
+
+
+def exercises(day):
+    return [e for e in DATA["exercises"] if e["day"] == day]
+
+
+def times_index():
+    """(ejercicio, alumno) -> {pasada: segundos}"""
+    idx = {}
+    for r in DATA["results"]:
+        idx.setdefault((r["ex"], r["st"]), {})[r["p"]] = r["sec"]
+    return idx
 
 
 def fmt(sec):
@@ -54,13 +49,13 @@ def fmt(sec):
 
 # ---------------------------------------------------------------- exportacion
 def write_day_blocks(ws, day):
-    """Un bloque por ejercicio. Todos los turnos comparten la planilla;
-    la columna 'Turno' indica a cual pertenece cada alumno."""
+    """Un bloque por ejercicio; todos los turnos comparten la planilla y la
+    columna 'Turno' indica a cual pertenece cada alumno."""
+    idx = times_index()
     row = 1
-    for ex_id, name, passes in q(
-        "SELECT id, name, passes FROM exercises WHERE day=? ORDER BY id", (day,)
-    ):
-        ws.cell(row, 1, f"{name}  ({day})").font = Font(bold=True, size=12)
+    for ex in exercises(day):
+        passes = ex["passes"]
+        ws.cell(row, 1, f"{ex['name']}  ({day})").font = Font(bold=True, size=12)
         row += 1
         headers = (
             ["Turno", "Alumno"]
@@ -70,48 +65,34 @@ def write_day_blocks(ws, day):
         for c, h in enumerate(headers, 1):
             ws.cell(row, c, h).font = Font(bold=True)
         row += 1
-        for sid, sname, turno in q(
-            "SELECT DISTINCT s.id, s.name, s.turno FROM students s "
-            "JOIN results r ON r.student_id=s.id WHERE r.exercise_id=? "
-            "ORDER BY s.turno, s.id",
-            (ex_id,),
-        ):
-            times = {
-                p: sec
-                for p, sec in q(
-                    "SELECT pass_no, seconds FROM results WHERE exercise_id=? AND student_id=?",
-                    (ex_id, sid),
-                )
-            }
-            ws.cell(row, 1, turno)
-            ws.cell(row, 2, sname)
+        for s in students():
+            t = idx.get((ex["id"], s["id"]))
+            if not t:
+                continue
+            ws.cell(row, 1, s["turno"])
+            ws.cell(row, 2, s["name"])
             for p in range(1, passes + 1):
-                if p in times:
-                    ws.cell(row, 2 + p, round(times[p], 2))
-            if times:
-                ws.cell(row, passes + 3, round(min(times.values()), 2))
-                ws.cell(row, passes + 4, round(sum(times.values()) / len(times), 2))
+                if p in t:
+                    ws.cell(row, 2 + p, round(t[p], 2))
+            ws.cell(row, passes + 3, round(min(t.values()), 2))
+            ws.cell(row, passes + 4, round(sum(t.values()) / len(t), 2))
             row += 1
         row += 1
     ws.column_dimensions["A"].width = 10
     ws.column_dimensions["B"].width = 28
 
 
-def export_day(day):
+def build_day_wb(day):
     wb = Workbook()
     ws = wb.active
     ws.title = day
     write_day_blocks(ws, day)
-    path = os.path.join(EXPORT_DIR, f"clase_{day}.xlsx")
-    wb.save(path)
-    return path
+    return wb
 
 
-def export_all():
-    """Una sola hoja: alumnos en filas (col. A) y, por cada dia, un titulo
-    arriba con los ejercicios como columnas angostas (una por pasada)."""
-    from openpyxl.utils import get_column_letter
-
+def build_all_wb():
+    """Una hoja: alumnos en filas (col. A); por cada dia un titulo arriba y
+    los ejercicios como columnas angostas (una por pasada)."""
     yellow = PatternFill("solid", fgColor="FFFF00")
     palette = ["00B050", "FFC000", "FF0000", "5B9BD5", "B084CC", "F4B183"]
     center = Alignment(horizontal="center", vertical="center", wrap_text=True)
@@ -121,10 +102,9 @@ def export_all():
     wb = Workbook()
     ws = wb.active
     ws.title = "Todos los dias"
+    studs = students()
+    idx = times_index()
 
-    students = q("SELECT id, name, turno FROM students ORDER BY turno, id")
-
-    # columnas fijas
     for col, text in ((1, "Nombre"), (2, "Turno")):
         c = ws.cell(2, col, text)
         c.fill, c.alignment, c.border = yellow, center, box
@@ -133,38 +113,29 @@ def export_all():
     ws.column_dimensions["A"].width = 28
     ws.column_dimensions["B"].width = 8
 
-    # tiempos: (ejercicio, alumno) -> {pasada: segundos}
-    times = {}
-    for ex_id, sid, p, sec in q("SELECT exercise_id, student_id, pass_no, seconds FROM results"):
-        times.setdefault((ex_id, sid), {})[p] = sec
-
     col = 3
-    for (day,) in q("SELECT DISTINCT day FROM exercises ORDER BY day"):
+    for day in sorted({e["day"] for e in DATA["exercises"]}):
         day_start = col
-        for i, (ex_id, ex_name, passes) in enumerate(
-            q("SELECT id, name, passes FROM exercises WHERE day=? ORDER BY id", (day,))
-        ):
+        for i, ex in enumerate(exercises(day)):
+            passes = ex["passes"]
             color = PatternFill("solid", fgColor=palette[i % len(palette)])
             first, last = col, col + passes - 1
-            # titulo del ejercicio (fila 2), combinado sobre sus pasadas
             if last > first:
                 ws.merge_cells(start_row=2, start_column=first, end_row=2, end_column=last)
-            h = ws.cell(2, first, ex_name)
-            h.fill, h.alignment, h.font = color, center, Font(bold=True)
+            h = ws.cell(2, first, ex["name"])
+            h.alignment, h.font = center, Font(bold=True)
             for cc in range(first, last + 1):
                 ws.cell(2, cc).fill = color
                 ws.cell(2, cc).border = box
                 ws.column_dimensions[get_column_letter(cc)].width = 7
-            # tiempos de cada alumno
-            for r, (sid, _, _) in enumerate(students, 3):
-                t = times.get((ex_id, sid), {})
+            for r, s in enumerate(studs, 3):
+                t = idx.get((ex["id"], s["id"]), {})
                 for p in range(1, passes + 1):
                     cell = ws.cell(r, first + p - 1)
                     cell.border = box
                     if p in t:
                         cell.value = round(t[p], 2)
             col = last + 1
-        # titulo del dia (fila 1), combinado sobre todos sus ejercicios
         if col > day_start:
             if col - 1 > day_start:
                 ws.merge_cells(start_row=1, start_column=day_start, end_row=1, end_column=col - 1)
@@ -174,28 +145,90 @@ def export_all():
                 ws.cell(1, cc).fill = yellow
                 ws.cell(1, cc).border = box
 
-    # nombre y turno de cada alumno
-    for r, (_, sname, turno) in enumerate(students, 3):
-        ws.cell(r, 1, sname).border = box
-        c = ws.cell(r, 2, turno)
+    for r, s in enumerate(studs, 3):
+        ws.cell(r, 1, s["name"]).border = box
+        c = ws.cell(r, 2, s["turno"])
         c.border, c.alignment = box, Alignment(horizontal="center")
 
     ws.freeze_panes = "C3"
-    path = os.path.join(EXPORT_DIR, "clase_todos_los_dias.xlsx")
-    wb.save(path)
-    return path
+    return wb
+
+
+def wb_bytes(wb):
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def wb_tsv(wb):
+    """Texto separado por tabs para pegar en Excel / Google Sheets.
+    Los decimales llevan coma (configuracion regional de Argentina)."""
+
+    def cell(v):
+        if v is None:
+            return ""
+        if isinstance(v, float):
+            return str(v).replace(".", ",")
+        return str(v)
+
+    ws = wb.active
+    return "\n".join("\t".join(cell(v) for v in row) for row in ws.iter_rows(values_only=True))
+
+
+def deliver(page, name, data):
+    """Descarga el archivo en el navegador (Pyodide). Fuera del navegador
+    (prueba en la compu) lo guarda en la carpeta temporal."""
+    try:
+        import js
+        from pyodide.ffi import to_js
+    except ImportError:
+        path = os.path.join(tempfile.gettempdir(), name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return f"Guardado en: {path}"
+
+    arr = js.Uint8Array.new(len(data))
+    arr.assign(data)
+    blob = js.Blob.new(to_js([arr]), to_js({"type": XLSX_MIME}, dict_converter=js.Object.fromEntries))
+    url = js.URL.createObjectURL(blob)
+    doc = getattr(js, "document", None)
+    if doc is not None:  # Python corre en el hilo principal
+        a = doc.createElement("a")
+        a.href = url
+        a.download = name
+        doc.body.appendChild(a)
+        a.click()
+        a.remove()
+        return f"Descarga iniciada: {name}"
+    page.launch_url(url)  # Python corre en un web worker
+    return "Se abrio el archivo en otra pestana. Si no se descarga, usa 'Copiar para pegar'."
 
 
 # ---------------------------------------------------------------- interfaz
-def main(page: ft.Page):
+async def main(page: ft.Page):
     page.title = "CronoClase"
     page.scroll = ft.ScrollMode.AUTO
     page.padding = 16
+
+    # cargar lo guardado en el navegador
+    raw = await page.client_storage.get_async(KEY)
+    if raw:
+        try:
+            DATA.update(json.loads(raw))
+        except ValueError:
+            pass
+
+    async def save_data():
+        await page.client_storage.set_async(KEY, json.dumps(DATA))
+
+    def commit():
+        page.run_task(save_data)
+
     settings = {
         "round_robin": False,
-        "turno_alta": None,  # turno elegido al dar de alta alumnos
-        "turno_filtro": None,  # turno elegido en la pantalla de cronometraje
-        "elegido": {},  # ejercicio -> alumno elegido manualmente
+        "turno_alta": None,
+        "turno_filtro": None,
+        "elegido": {},  # ejercicio -> alumno elegido a mano
     }
 
     def today():
@@ -209,9 +242,6 @@ def main(page: ft.Page):
     def back_btn(target):
         return ft.TextButton("< Volver", on_click=lambda e: target())
 
-    def all_turnos():
-        return [t for (t,) in q("SELECT id FROM turnos ORDER BY id")]
-
     # ---------------- inicio
     def show_home():
         render(
@@ -224,7 +254,7 @@ def main(page: ft.Page):
 
     # ---------------- turnos y alumnos
     def show_students():
-        turnos = all_turnos()
+        turnos = sorted(DATA["turnos"])
         alta = settings["turno_alta"]
         if alta not in turnos:
             alta = turnos[0] if turnos else None
@@ -237,12 +267,16 @@ def main(page: ft.Page):
         def add_turno(e):
             v = turno_in.value.strip()
             if v.lstrip("-").isdigit():
-                run("INSERT OR IGNORE INTO turnos(id) VALUES (?)", (int(v),))
-                settings["turno_alta"] = int(v)
+                n = int(v)
+                if n not in DATA["turnos"]:
+                    DATA["turnos"].append(n)
+                settings["turno_alta"] = n
+                commit()
                 show_students()
 
         def delete_turno(t):
-            run("DELETE FROM turnos WHERE id=?", (t,))
+            DATA["turnos"].remove(t)
+            commit()
             show_students()
 
         turno_dd = ft.Dropdown(
@@ -256,30 +290,31 @@ def main(page: ft.Page):
 
         def add_student(e):
             if name_in.value.strip() and turno_dd.value is not None:
-                run(
-                    "INSERT INTO students(name, turno) VALUES (?, ?)",
-                    (name_in.value.strip(), int(turno_dd.value)),
+                DATA["students"].append(
+                    {"id": next_id(), "name": name_in.value.strip(), "turno": int(turno_dd.value)}
                 )
+                commit()
                 show_students()
 
         def delete_student(sid):
-            run("DELETE FROM results WHERE student_id=?", (sid,))
-            run("DELETE FROM students WHERE id=?", (sid,))
+            DATA["students"][:] = [s for s in DATA["students"] if s["id"] != sid]
+            DATA["results"][:] = [r for r in DATA["results"] if r["st"] != sid]
+            commit()
             show_students()
 
         listing = []
         for t in turnos:
-            studs = q("SELECT id, name FROM students WHERE turno=? ORDER BY id", (t,))
+            studs = students(t)
             header = [ft.Text(f"Turno {t}", size=18, weight=ft.FontWeight.BOLD)]
             if not studs:
                 header.append(ft.TextButton("Borrar turno", on_click=lambda e, t=t: delete_turno(t)))
             listing.append(ft.Row(header))
-            for sid, sname in studs:
+            for s in studs:
                 listing.append(
                     ft.Row(
                         [
-                            ft.Text(sname, expand=True),
-                            ft.TextButton("Borrar", on_click=lambda e, i=sid: delete_student(i)),
+                            ft.Text(s["name"], expand=True),
+                            ft.TextButton("Borrar", on_click=lambda e, i=s["id"]: delete_student(i)),
                         ]
                     )
                 )
@@ -304,31 +339,35 @@ def main(page: ft.Page):
 
         def add(e):
             if name_in.value.strip() and passes_in.value.strip().isdigit():
-                run(
-                    "INSERT INTO exercises(day, name, passes) VALUES (?,?,?)",
-                    (today(), name_in.value.strip(), int(passes_in.value)),
+                DATA["exercises"].append(
+                    {
+                        "id": next_id(),
+                        "day": today(),
+                        "name": name_in.value.strip(),
+                        "passes": int(passes_in.value),
+                    }
                 )
+                commit()
                 show_today()
 
         def delete(eid):
-            run("DELETE FROM results WHERE exercise_id=?", (eid,))
-            run("DELETE FROM exercises WHERE id=?", (eid,))
+            DATA["exercises"][:] = [x for x in DATA["exercises"] if x["id"] != eid]
+            DATA["results"][:] = [r for r in DATA["results"] if r["ex"] != eid]
+            commit()
             show_today()
 
         rows = [
             ft.Row(
                 [
                     ft.ElevatedButton(
-                        f"{n} ({p} pasadas)",
+                        f"{x['name']} ({x['passes']} pasadas)",
                         expand=True,
-                        on_click=lambda e, i=i: show_run(i),
+                        on_click=lambda e, i=x["id"]: show_run(i),
                     ),
-                    ft.TextButton("Borrar", on_click=lambda e, i=i: delete(i)),
+                    ft.TextButton("Borrar", on_click=lambda e, i=x["id"]: delete(i)),
                 ]
             )
-            for i, n, p in q(
-                "SELECT id, name, passes FROM exercises WHERE day=? ORDER BY id", (today(),)
-            )
+            for x in exercises(today())
         ]
         render(
             back_btn(show_home),
@@ -342,45 +381,34 @@ def main(page: ft.Page):
 
     # ---------------- cronometro por ejercicio
     def show_run(ex_id):
-        ex_name, passes = q("SELECT name, passes FROM exercises WHERE id=?", (ex_id,))[0]
-        turnos = all_turnos()
+        ex = next(x for x in DATA["exercises"] if x["id"] == ex_id)
+        passes = ex["passes"]
+        turnos = sorted(DATA["turnos"])
         tf = settings["turno_filtro"]
         if tf not in turnos:
             tf = None
             settings["turno_filtro"] = None
 
-        if tf is None:
-            students = q("SELECT id, name, turno FROM students ORDER BY turno, id")
-        else:
-            students = q(
-                "SELECT id, name, turno FROM students WHERE turno=? ORDER BY id", (tf,)
-            )
-        counts = {
-            sid: q(
-                "SELECT COUNT(*) FROM results WHERE exercise_id=? AND student_id=?",
-                (ex_id, sid),
-            )[0][0]
-            for sid, _, _ in students
-        }
-        by_id = {sid: (sname, t) for sid, sname, t in students}
+        studs = students(tf)
+        idx = times_index()
+        counts = {s["id"]: len(idx.get((ex_id, s["id"]), {})) for s in studs}
+        by_id = {s["id"]: s for s in studs}
 
-        # quien sigue: primero el alumno elegido a mano, si no el orden automatico
-        current = None
+        # quien sigue: el alumno elegido a mano o, si no, el orden automatico
+        current = None  # (alumno, numero de pasada)
         chosen = settings["elegido"].get(ex_id)
         if chosen in by_id and counts[chosen] < passes:
-            current = (chosen, by_id[chosen][0], counts[chosen] + 1)
-        elif students:
+            current = (by_id[chosen], counts[chosen] + 1)
+        elif studs:
             if settings["round_robin"]:
                 lowest = min(counts.values())
                 if lowest < passes:
-                    for sid, sname, _ in students:
-                        if counts[sid] == lowest:
-                            current = (sid, sname, lowest + 1)
-                            break
+                    s = next(s for s in studs if counts[s["id"]] == lowest)
+                    current = (s, lowest + 1)
             else:
-                for sid, sname, _ in students:
-                    if counts[sid] < passes:
-                        current = (sid, sname, counts[sid] + 1)
+                for s in studs:
+                    if counts[s["id"]] < passes:
+                        current = (s, counts[s["id"]] + 1)
                         break
 
         state = {"running": False, "t0": 0.0}
@@ -403,20 +431,26 @@ def main(page: ft.Page):
             else:
                 elapsed = time.perf_counter() - state["t0"]
                 state["running"] = False
-                run(
-                    "INSERT INTO results(exercise_id, student_id, pass_no, seconds) VALUES (?,?,?,?)",
-                    (ex_id, current[0], current[2], elapsed),
+                DATA["results"].append(
+                    {
+                        "id": next_id(),
+                        "ex": ex_id,
+                        "st": current[0]["id"],
+                        "p": current[1],
+                        "sec": elapsed,
+                    }
                 )
+                commit()
                 show_run(ex_id)
 
         btn.on_click = toggle
 
         def undo(e):
-            last = q(
-                "SELECT id FROM results WHERE exercise_id=? ORDER BY id DESC LIMIT 1", (ex_id,)
-            )
-            if last:
-                run("DELETE FROM results WHERE id=?", (last[0][0],))
+            for i in range(len(DATA["results"]) - 1, -1, -1):
+                if DATA["results"][i]["ex"] == ex_id:
+                    del DATA["results"][i]
+                    break
+            commit()
             show_run(ex_id)
 
         def set_mode(e):
@@ -455,40 +489,40 @@ def main(page: ft.Page):
             options=[ft.dropdown.Option("auto", "Automatico (siguiente)")]
             + [
                 ft.dropdown.Option(
-                    str(sid), f"{sname} (T{t}) {counts[sid]}/{passes}"
+                    str(s["id"]), f"{s['name']} (T{s['turno']}) {counts[s['id']]}/{passes}"
                 )
-                for sid, sname, t in students
+                for s in studs
             ],
             value=str(chosen) if chosen in by_id else "auto",
             on_change=set_student,
         )
 
         if current:
-            sname, st = by_id[current[0]][0], by_id[current[0]][1]
             head = [
-                ft.Text(f"{sname}  (Turno {st})", size=26, weight=ft.FontWeight.BOLD),
-                ft.Text(f"Pasada {current[2]} de {passes}", size=18),
+                ft.Text(
+                    f"{current[0]['name']}  (Turno {current[0]['turno']})",
+                    size=26,
+                    weight=ft.FontWeight.BOLD,
+                ),
+                ft.Text(f"Pasada {current[1]} de {passes}", size=18),
                 label,
                 btn,
             ]
-        elif not students:
+        elif not studs:
             head = [ft.Text("No hay alumnos en esta seleccion.")]
         else:
             head = [ft.Text("Ejercicio completo", size=24, weight=ft.FontWeight.BOLD)]
 
         summary = []
-        for sid, sname, t in students:
-            times = q(
-                "SELECT seconds FROM results WHERE exercise_id=? AND student_id=? ORDER BY pass_no",
-                (ex_id, sid),
-            )
+        for s in studs:
+            t = idx.get((ex_id, s["id"]), {})
             summary.append(
-                ft.Text(f"[T{t}] {sname}: " + "  |  ".join(fmt(x[0]) for x in times))
+                ft.Text(f"[T{s['turno']}] {s['name']}: " + "  |  ".join(fmt(t[p]) for p in sorted(t)))
             )
 
         render(
             ft.TextButton("< Volver", on_click=leave),
-            ft.Text(ex_name, size=22, weight=ft.FontWeight.BOLD),
+            ft.Text(ex["name"], size=22, weight=ft.FontWeight.BOLD),
             ft.Row([turno_dd, student_dd]),
             ft.Switch(
                 label="Rotar alumnos en cada pasada",
@@ -505,20 +539,41 @@ def main(page: ft.Page):
     def show_export():
         out = ft.Text("")
 
-        def do_day(e):
-            out.value = f"Guardado en:\n{export_day(today())}"
+        def say(msg):
+            out.value = msg
             out.update()
 
-        def do_all(e):
-            out.value = f"Guardado en:\n{export_all()}"
-            out.update()
+        def dl_day(e):
+            say(deliver(page, f"clase_{today()}.xlsx", wb_bytes(build_day_wb(today()))))
+
+        def dl_all(e):
+            say(deliver(page, "clase_todos_los_dias.xlsx", wb_bytes(build_all_wb())))
+
+        def copy_day(e):
+            page.set_clipboard(wb_tsv(build_day_wb(today())))
+            say("Copiado. Pegalo en Excel o Google Sheets (celda A1).")
+
+        def copy_all(e):
+            page.set_clipboard(wb_tsv(build_all_wb()))
+            say("Copiado. Pegalo en Excel o Google Sheets (celda A1).")
 
         render(
             back_btn(show_home),
-            ft.Text("Exportar a Excel", size=24, weight=ft.FontWeight.BOLD),
-            ft.ElevatedButton("Exportar el dia de hoy", on_click=do_day, width=300),
-            ft.ElevatedButton("Exportar todos los dias", on_click=do_all, width=300),
+            ft.Text("Exportar", size=24, weight=ft.FontWeight.BOLD),
+            ft.Text("Descargar Excel (.xlsx)", weight=ft.FontWeight.BOLD),
+            ft.ElevatedButton("El dia de hoy", on_click=dl_day, width=300),
+            ft.ElevatedButton("Todos los dias", on_click=dl_all, width=300),
+            ft.Divider(),
+            ft.Text("Copiar para pegar en Excel / Sheets", weight=ft.FontWeight.BOLD),
+            ft.ElevatedButton("Copiar el dia de hoy", on_click=copy_day, width=300),
+            ft.ElevatedButton("Copiar todos los dias", on_click=copy_all, width=300),
             out,
+            ft.Divider(),
+            ft.Text(
+                "Los datos se guardan en este navegador. Si borras los datos del sitio "
+                "se pierden: exporta seguido.",
+                size=12,
+            ),
         )
 
     show_home()
